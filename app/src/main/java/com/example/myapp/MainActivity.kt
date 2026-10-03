@@ -1596,8 +1596,8 @@ class MainActivity : Activity() {
             p.list.setBackgroundColor(if (p.num == phase) Color.WHITE else col("#F0F0F0"))
             p.redraw()
         }
-        setEn(sw1, phase != 1)
-        setEn(sw2, phase != 2)
+        setEn(sw1, phase != 1 || (layoutMode >= 2 && layoutMode != 2))
+        setEn(sw2, phase != 2 || (layoutMode >= 2 && layoutMode != 3))
         updateSelectionLabel()
     }
 
@@ -1622,6 +1622,7 @@ class MainActivity : Activity() {
     private fun cycleLayout() {
         layoutMode = (layoutMode + 1) % 4
         applyLayout()
+        updateUi()
         val names = arrayOf("Two panels: side by side", "Two panels: stacked", "File 1 only", "File 2 only")
         toast(names[layoutMode])
         saveView()
@@ -1721,14 +1722,29 @@ class MainActivity : Activity() {
         saveView()
     }
 
+    // In single-file layouts (2 = File 1 only, 3 = File 2 only) show the panel being switched to.
+    private fun showOnlyIfSingle(n: Int) {
+        if (layoutMode >= 2) {
+            layoutMode = n + 1
+            applyLayout()
+        }
+    }
+
     private fun switchTo(n: Int) {
         if (phase == n) {
-            toast("Already mapping File $n")
+            if (layoutMode >= 2 && layoutMode != n + 1) {
+                showOnlyIfSingle(n)
+                updateUi()
+                saveView()
+            } else {
+                toast("Already mapping File $n")
+            }
             return
         }
         confirm("Switch to File $n?\nFile $phase has ${maps(phase).size} mappings.") {
             phase = n
             panel(n).selected.clear()
+            showOnlyIfSingle(n)
             updateUi()
             saveView()
         }
