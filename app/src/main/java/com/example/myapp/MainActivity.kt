@@ -826,6 +826,8 @@ class Panel(val act: MainActivity, val num: Int) {
 
     // ---------------- loading ----------------
     fun loadFile(u: String?, restoreGlobal: Int, restoreTop: Int, force: Boolean) {
+        reloadSrc?.close()
+        reloadSrc = null
         src?.close()
         src = null
         loadGen++
@@ -858,14 +860,58 @@ class Panel(val act: MainActivity, val num: Int) {
         act.updateFileLabels()
     }
 
+    // Refresh: the old text stays on screen while the file is re-indexed in the
+    // background; then the new source is swapped in at the CURRENT scroll position.
+    var reloadSrc: LineSource? = null
+
     fun reload() {
         val u = uriStr ?: return
-        val g = firstGlobal()
+        reloadSrc?.close()
+        reloadSrc = null
+        val ns = LineSource(act, Uri.parse(u))
+        if (!ns.open()) {
+            act.toast("File $num: " + (ns.error ?: "cannot open"))
+            ns.close()
+            return
+        }
+        ns.deleteIndexFile()
+        ns.startIndex()
+        reloadSrc = ns
+        act.ensureTicker()
+    }
+
+    private fun checkReload() {
+        val rs = reloadSrc ?: return
+        if (rs.error != null) {
+            act.toast("File $num: " + (rs.error ?: "refresh failed"))
+            rs.close()
+            reloadSrc = null
+            return
+        }
+        val g0 = firstGlobal()
+        val ready = rs.done || rs.lineCount > g0 + act.linesPerPage + 500
+        if (!ready) return
+        var g = g0
         val t = firstTop()
-        loadFile(u, g, t, true)
+        src?.close()
+        src = rs
+        reloadSrc = null
+        loadGen++
+        loading.clear()
+        cache.evictAll()
+        pendingGlobal = -1
+        if (rs.lineCount > 0 && g >= rs.lineCount) g = rs.lineCount - 1
+        if (g < 0) g = 0
+        if (!scrollMode) page = g / act.linesPerPage + 1
+        refreshWindow()
+        val idx = g - winBase
+        list.setSelectionFromTop(if (idx < 0) 0 else idx, t)
+        list.post { list.setSelectionFromTop(if (idx < 0) 0 else idx, t) }
+        act.updateFileLabels()
     }
 
     fun tick() {
+        checkReload()
         val s = src ?: return
         tryRestore()
         refreshWindow(false)
@@ -1199,6 +1245,7 @@ class MainActivity : Activity() {
                 p.tick()
                 val s = p.src
                 if (s != null && !s.done) any = true
+                if (p.reloadSrc != null) any = true
             }
             updateFileLabels()
             if (any) handler.postDelayed(this, 300) else tickerOn = false
@@ -1410,6 +1457,8 @@ class MainActivity : Activity() {
         super.onDestroy()
         p1.src?.close()
         p2.src?.close()
+        p1.reloadSrc?.close()
+        p2.reloadSrc?.close()
     }
 
     // ---------------- state ----------------
