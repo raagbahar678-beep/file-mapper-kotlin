@@ -715,7 +715,7 @@ class Panel(val act: MainActivity, val num: Int) {
 
         hseek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser) setHOff(progress)
+                if (fromUser) applyHOff(progress)
             }
 
             override fun onStartTrackingTouch(sb: SeekBar?) {
@@ -778,7 +778,7 @@ class Panel(val act: MainActivity, val num: Int) {
         return if (mx < 0) 0 else mx
     }
 
-    fun setHOff(v: Int) {
+    fun applyHOff(v: Int) {
         val mx = maxHOff()
         var n = v
         if (n > mx) n = mx
@@ -792,7 +792,7 @@ class Panel(val act: MainActivity, val num: Int) {
 
     fun panByChars(d: Int) {
         if (wrapMode) return
-        setHOff(hOff + d)
+        applyHOff(hOff + d)
     }
 
     fun updateHSeek() {
