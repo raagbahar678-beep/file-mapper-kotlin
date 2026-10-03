@@ -1550,6 +1550,10 @@ class MainActivity : Activity() {
             val layoutId = if (t < 2) android.R.layout.simple_list_item_multiple_choice else android.R.layout.simple_list_item_1
             lv.adapter = ArrayAdapter<String>(this, layoutId, list)
             lv.clearChoices()
+            if (list.isNotEmpty()) {
+                val last = list.size - 1
+                lv.post { lv.setSelection(last) }
+            }
             emptyTv.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
             delRow.visibility = if (t < 2) View.VISIBLE else View.GONE
             btnT[0]?.text = "File 1 (${maps1.size})"
