@@ -28,6 +28,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -204,6 +205,7 @@ class LineSource(private val ctx: Context, val uri: Uri) {
     // ---- background indexing ----
     fun startIndex() {
         val t = Thread(Runnable { indexRun() })
+        t.priority = Thread.NORM_PRIORITY - 2
         t.isDaemon = true
         t.start()
     }
@@ -331,7 +333,7 @@ class LineSource(private val ctx: Context, val uri: Uri) {
     fun find(term: String, from: Int, forward: Boolean, cancel: () -> Boolean): Int {
         val total = lineCount
         if (total <= 0) return -1
-        val chunk = 1024
+        val chunk = 256
         val start = ((from % total) + total) % total
         var scanned = 0
         if (forward) {
@@ -339,7 +341,7 @@ class LineSource(private val ctx: Context, val uri: Uri) {
             while (scanned < total) {
                 if (cancel()) return -1
                 val n = if (chunk < total - p) chunk else total - p
-                val arr = readLines(p, n, 200000)
+                val arr = readLines(p, n, 1000000)
                 if (arr.isEmpty()) return -1
                 for (i in arr.indices) {
                     if (arr[i].contains(term, true)) return p + i
@@ -353,7 +355,7 @@ class LineSource(private val ctx: Context, val uri: Uri) {
             while (scanned < total) {
                 if (cancel()) return -1
                 val s0 = if (e - chunk > 0) e - chunk else 0
-                val arr = readLines(s0, e - s0, 200000)
+                val arr = readLines(s0, e - s0, 1000000)
                 if (arr.isEmpty()) return -1
                 var i = arr.size - 1
                 while (i >= 0) {
@@ -388,15 +390,40 @@ class Panel(val act: MainActivity, val num: Int) {
     var searchGen: Int = 0
     var winBase: Int = 0
     var winCount: Int = 0
-    var maxBytes: Int = 800
+    var maxBytes: Int = 1000000
     var pendingGlobal: Int = -1
     var pendingTop: Int = 0
     var userSeek: Boolean = false
-    val cache = LruCache<Int, Array<String>>(500)
+    var hUser: Boolean = false
+    var wrapMode: Boolean = false
+    @Volatile var wantLo: Int = 0
+    @Volatile var wantHi: Int = 0
+    @Volatile var loadGen: Int = 0
+    val loading = HashSet<Int>()
+    val exec: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        val t = Thread(r)
+        t.isDaemon = true
+        t
+    }
+    var hOff: Int = 0
+    var visChars: Int = 100
+    var charW: Float = 10f
+    var tx: Float = 0f
+    var ty: Float = 0f
+    var lastX: Float = 0f
+    var panAcc: Float = 0f
+    var hPan: Boolean = false
+    val slop: Int = ViewConfiguration.get(act).scaledTouchSlop
+    val cache = object : LruCache<Int, Array<String>>(12000000) {
+        override fun sizeOf(key: Int, value: Array<String>): Int {
+            var n = 0
+            for (s in value) n += s.length + 16
+            return if (n < 1) 1 else n
+        }
+    }
 
     val root = LinearLayout(act)
     val list = ListView(act)
-    val hsv = HorizontalScrollView(act)
     val seek = SeekBar(act)
     lateinit var modeBtn: Button
     lateinit var prevBtn: Button
@@ -406,6 +433,8 @@ class Panel(val act: MainActivity, val num: Int) {
     lateinit var gotoEt: EditText
     lateinit var findEt: EditText
     lateinit var jumpEt: EditText
+    lateinit var wrapBtn: Button
+    val hseek = SeekBar(act)
 
     val adapter = object : BaseAdapter() {
         override fun getCount(): Int = winCount
@@ -415,7 +444,8 @@ class Panel(val act: MainActivity, val num: Int) {
             val tv: TextView = (convertView as? TextView) ?: makeRow()
             val g = winBase + position
             val ln = g + 1
-            val line = getLine(g)
+            val loaded = getLineOrNull(g)
+            val line = loaded ?: ""
             val sb = StringBuilder()
             val ns = ln.toString()
             var k = ns.length
@@ -423,7 +453,26 @@ class Panel(val act: MainActivity, val num: Int) {
                 sb.append(' ')
                 k++
             }
-            sb.append(ns).append(" | ").append(line)
+            sb.append(ns).append(" | ")
+            if (loaded == null) {
+                sb.append("…")
+            } else if (wrapMode) {
+                if (line.length > 10000) {
+                    sb.append(line, 0, 10000)
+                    sb.append(" … (+").append(line.length - 10000).append(" chars: turn Wrap off and pan sideways)")
+                } else {
+                    sb.append(line)
+                }
+            } else if (hOff < line.length) {
+                var en = hOff + visChars + 2
+                if (en > line.length) en = line.length
+                sb.append(line, hOff, en)
+            }
+            val wasWrap = tv.tag as? Boolean
+            if (wasWrap == null || wasWrap != wrapMode) {
+                tv.setSingleLine(!wrapMode)
+                tv.tag = wrapMode
+            }
             tv.text = sb
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, act.fontSp)
             val color = if (ln == currentMatch || ln == highlightLine) COL_CURRENT
@@ -447,20 +496,55 @@ class Panel(val act: MainActivity, val num: Int) {
         return tv
     }
 
-    private fun block(b: Int): Array<String> {
-        val c = cache.get(b)
-        if (c != null) return c
-        val s = src ?: return emptyArray()
-        val arr = s.readLines(b shl 6, 64, maxBytes)
-        if (arr.size == 64 || s.done) cache.put(b, arr)
-        return arr
+    private fun touchWant(b: Int) {
+        if (b < wantLo || b > wantHi) {
+            wantLo = b - 3
+            wantHi = b + 3
+        }
     }
 
-    private fun getLine(g: Int): String {
-        val arr = block(g shr 6)
+    // Blocks are read on a background thread; the UI thread never touches the disk.
+    private fun requestBlock(b: Int) {
+        if (!loading.add(b)) return
+        val s = src
+        if (s == null) {
+            loading.remove(b)
+            return
+        }
+        val myGen = loadGen
+        exec.execute(Runnable {
+            if (myGen != loadGen || b < wantLo || b > wantHi) {
+                act.runOnUiThread { loading.remove(b) }
+                return@Runnable
+            }
+            val arr = s.readLines(b shl 6, 64, maxBytes)
+            act.runOnUiThread {
+                loading.remove(b)
+                if (myGen == loadGen) {
+                    if (arr.size == 64 || s.done) cache.put(b, arr)
+                    adapter.notifyDataSetChanged()
+                    updateHSeek()
+                }
+            }
+        })
+    }
+
+    private fun block(b: Int): Array<String>? {
+        val c = cache.get(b)
+        if (c != null) return c
+        requestBlock(b)
+        return null
+    }
+
+    private fun getLineOrNull(g: Int): String? {
+        val b = g shr 6
+        touchWant(b)
+        val arr = block(b) ?: return null
         val i = g and 63
         return if (i < arr.size) arr[i] else ""
     }
+
+    private fun getLine(g: Int): String = getLineOrNull(g) ?: ""
 
     private fun hrow(bg: Int, vararg vs: View): HorizontalScrollView {
         val h = HorizontalScrollView(act)
@@ -500,9 +584,10 @@ class Panel(val act: MainActivity, val num: Int) {
         val openB = act.sbtn("Open", col("#455A64")) { act.pickFile(num) }
         val refB = act.sbtn("🔄 Refresh", grey) { reload() }
         modeBtn = act.sbtn("Mode: Paged", col("#8E24AA")) { toggleMode() }
-        val fm = act.sbtn("A−", grey) { act.changeFont(-1f) }
+        wrapBtn = act.sbtn("Wrap: Off", col("#00796B")) { toggleWrap() }
+        val fm = act.sbtn("A-", grey) { act.changeFont(-1f) }
         val fp = act.sbtn("A+", grey) { act.changeFont(1f) }
-        root.addView(hrow(col("#F0F0F0"), title, openB, refB, modeBtn, fm, fp))
+        root.addView(hrow(col("#F0F0F0"), title, openB, refB, modeBtn, wrapBtn, fm, fp))
 
         gotoEt = act.edit(64, true, "line")
         gotoEt.imeOptions = EditorInfo.IME_ACTION_GO
@@ -562,7 +647,7 @@ class Panel(val act: MainActivity, val num: Int) {
         list.overScrollMode = View.OVER_SCROLL_NEVER
         list.setSelector(ColorDrawable(Color.TRANSPARENT))
         list.cacheColorHint = Color.TRANSPARENT
-        list.isVerticalScrollBarEnabled = false
+        list.isVerticalScrollBarEnabled = true
         list.adapter = adapter
         list.setBackgroundColor(Color.WHITE)
         list.setOnItemClickListener { _, _, pos, _ -> onRowClick(winBase + pos + 1) }
@@ -570,11 +655,51 @@ class Panel(val act: MainActivity, val num: Int) {
             copyLine(winBase + pos + 1)
             true
         }
-        list.setOnTouchListener { _, _ ->
+        list.setOnTouchListener { _, ev ->
             act.lastPanel = this
             pendingGlobal = -1
-            act.dropEditFocus()
-            false
+            var consumed = false
+            val a = ev.actionMasked
+            if (a == MotionEvent.ACTION_DOWN) {
+                act.dropEditFocus()
+                tx = ev.x
+                ty = ev.y
+                lastX = ev.x
+                panAcc = 0f
+                hPan = false
+            } else if (a == MotionEvent.ACTION_MOVE) {
+                if (!wrapMode) {
+                    if (!hPan) {
+                        val dx = ev.x - tx
+                        val dy = ev.y - ty
+                        if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy) * 2f) {
+                            hPan = true
+                            val c = MotionEvent.obtain(ev)
+                            c.action = MotionEvent.ACTION_CANCEL
+                            list.onTouchEvent(c)
+                            c.recycle()
+                            lastX = ev.x
+                        }
+                    }
+                    if (hPan) {
+                        panAcc += (lastX - ev.x) / charW
+                        lastX = ev.x
+                        val whole = panAcc.toInt()
+                        if (whole != 0) {
+                            panByChars(whole)
+                            panAcc -= whole.toFloat()
+                        }
+                        consumed = true
+                    }
+                }
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                if (hPan) {
+                    consumed = true
+                    hPan = false
+                    panAcc = 0f
+                }
+            }
+            consumed
         }
         list.setOnScrollListener(object : AbsListView.OnScrollListener {
             override fun onScrollStateChanged(view: AbsListView?, scrollState: Int) {
@@ -583,16 +708,39 @@ class Panel(val act: MainActivity, val num: Int) {
 
             override fun onScroll(view: AbsListView?, firstVisibleItem: Int, visibleItemCount: Int, totalItemCount: Int) {
                 updateRange()
+                updateHSeek()
             }
         })
-        hsv.isFillViewport = true
-        hsv.isHorizontalScrollBarEnabled = true
-        hsv.setBackgroundColor(Color.WHITE)
-        hsv.addView(list, FrameLayout.LayoutParams(4000, MP))
-        root.addView(hsv, LinearLayout.LayoutParams(MP, 0, 1f))
+        root.addView(list, LinearLayout.LayoutParams(MP, 0, 1f))
+
+        hseek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) setHOff(progress)
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar?) {
+                hUser = true
+            }
+
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                hUser = false
+            }
+        })
+        list.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            val nv = computeVis()
+            if (nv != visChars) {
+                visChars = nv
+                list.post {
+                    adapter.notifyDataSetChanged()
+                    updateHSeek()
+                }
+            }
+        }
+        root.addView(hseek, LinearLayout.LayoutParams(MP, WC))
 
         applyFont()
         applyModeUi()
+        applyWrapUi()
     }
 
     // ---------------- font / width ----------------
@@ -602,13 +750,74 @@ class Panel(val act: MainActivity, val num: Int) {
         p.textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, act.fontSp, act.resources.displayMetrics)
         var cw = p.measureText("0")
         if (cw < 1f) cw = 1f
-        var w = (cw * 1200f).toInt()
-        if (w > 30000) w = 30000
-        maxBytes = (w / cw).toInt() - 14
-        if (maxBytes < 200) maxBytes = 200
-        list.layoutParams = FrameLayout.LayoutParams(w, MP)
+        charW = cw
+        visChars = computeVis()
         cache.evictAll()
         adapter.notifyDataSetChanged()
+        updateHSeek()
+    }
+
+    fun computeVis(): Int {
+        val w = list.width
+        if (w <= 0) return 100
+        val v = ((w - act.dp(8)) / charW).toInt() - 8
+        return if (v < 10) 10 else v
+    }
+
+    fun maxHOff(): Int {
+        var m = 0
+        val f = list.firstVisiblePosition
+        val l = list.lastVisiblePosition
+        var pos = f
+        while (pos <= l && pos < winCount) {
+            val len = getLine(winBase + pos).length
+            if (len > m) m = len
+            pos++
+        }
+        val mx = m - visChars
+        return if (mx < 0) 0 else mx
+    }
+
+    fun setHOff(v: Int) {
+        val mx = maxHOff()
+        var n = v
+        if (n > mx) n = mx
+        if (n < 0) n = 0
+        if (n != hOff) {
+            hOff = n
+            adapter.notifyDataSetChanged()
+        }
+        if (!hUser && hseek.progress != n) hseek.progress = n
+    }
+
+    fun panByChars(d: Int) {
+        if (wrapMode) return
+        setHOff(hOff + d)
+    }
+
+    fun updateHSeek() {
+        if (wrapMode) return
+        val mx = maxHOff()
+        val smx = if (mx < 1) 1 else mx
+        if (hseek.max != smx) hseek.max = smx
+        val shown = if (hOff < mx) hOff else mx
+        if (!hUser && hseek.progress != shown) hseek.progress = shown
+    }
+
+    fun applyWrapUi() {
+        wrapBtn.text = if (wrapMode) "Wrap: On" else "Wrap: Off"
+        hseek.visibility = if (wrapMode) View.GONE else View.VISIBLE
+        adapter.notifyDataSetChanged()
+        updateHSeek()
+    }
+
+    fun toggleWrap() {
+        val f = list.firstVisiblePosition
+        wrapMode = !wrapMode
+        hOff = 0
+        applyWrapUi()
+        list.post { list.setSelectionFromTop(f, 0) }
+        act.saveView()
     }
 
     fun redraw() {
@@ -619,6 +828,8 @@ class Panel(val act: MainActivity, val num: Int) {
     fun loadFile(u: String?, restoreGlobal: Int, restoreTop: Int, force: Boolean) {
         src?.close()
         src = null
+        loadGen++
+        loading.clear()
         cache.evictAll()
         uriStr = u
         winBase = 0
@@ -929,11 +1140,22 @@ class Panel(val act: MainActivity, val num: Int) {
 
     fun copyLine(ln: Int) {
         val s = src ?: return
-        val a = s.readLines(ln - 1, 1, 8000000)
-        if (a.isEmpty()) return
-        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("line", a[0]))
-        act.toast("Copied line $ln")
+        val th = Thread(Runnable {
+            val a = s.readLines(ln - 1, 1, 8000000)
+            act.runOnUiThread {
+                if (a.isNotEmpty()) {
+                    try {
+                        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("line", a[0]))
+                        act.toast("Copied line $ln")
+                    } catch (e: Exception) {
+                        act.toast("Line too large for the clipboard")
+                    }
+                }
+            }
+        })
+        th.isDaemon = true
+        th.start()
     }
 
     fun copyCursor() {
@@ -1238,6 +1460,8 @@ class MainActivity : Activity() {
             val n = p.num
             e.putString("uri$n", p.uriStr)
             e.putBoolean("scroll$n", p.scrollMode)
+            e.putBoolean("wrap$n", p.wrapMode)
+            e.putInt("hoff$n", p.hOff)
             e.putInt("pos$n", p.firstGlobal())
             e.putInt("top$n", p.firstTop())
             e.putString("sel$n", p.selected.joinToString(","))
@@ -1254,6 +1478,8 @@ class MainActivity : Activity() {
         for (p in listOf(p1, p2)) {
             val n = p.num
             p.scrollMode = prefs.getBoolean("scroll$n", false)
+            p.wrapMode = prefs.getBoolean("wrap$n", false)
+            p.hOff = prefs.getInt("hoff$n", 0)
             val ss = prefs.getString("sel$n", "") ?: ""
             for (x in ss.split(",")) {
                 val v = x.trim().toIntOrNull()
@@ -1261,6 +1487,7 @@ class MainActivity : Activity() {
             }
             p.cursorLine = prefs.getInt("cur$n", -1)
             p.applyModeUi()
+            p.applyWrapUi()
         }
         rebuildMapped()
         for (p in listOf(p1, p2)) {
@@ -1726,6 +1953,14 @@ class MainActivity : Activity() {
                     lastPanel.prevPage()
                     return true
                 }
+                if (e.keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                    lastPanel.panByChars(if (ctrl) -50 else -10)
+                    return true
+                }
+                if (e.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                    lastPanel.panByChars(if (ctrl) 50 else 10)
+                    return true
+                }
             }
         }
         return super.dispatchKeyEvent(e)
@@ -1752,7 +1987,7 @@ class MainActivity : Activity() {
             }
             if (shift) {
                 val p = panelAt(ev.rawX, ev.rawY)
-                if (p != null) p.hsv.scrollBy((-v * 160f).toInt(), 0)
+                if (p != null) p.panByChars((-v * 8f).toInt())
                 return true
             }
         }
