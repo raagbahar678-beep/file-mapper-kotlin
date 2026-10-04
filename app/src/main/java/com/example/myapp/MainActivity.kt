@@ -658,6 +658,7 @@ class Panel(val act: MainActivity, val num: Int) {
         list.setOnTouchListener { _, ev ->
             act.lastPanel = this
             pendingGlobal = -1
+            enforceG = -1
             var consumed = false
             val a = ev.actionMasked
             if (a == MotionEvent.ACTION_DOWN) {
@@ -727,12 +728,14 @@ class Panel(val act: MainActivity, val num: Int) {
             }
         })
         list.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (enforceG >= 0) list.post { applyEnforce() }
             val nv = computeVis()
             if (nv != visChars) {
                 visChars = nv
                 list.post {
                     adapter.notifyDataSetChanged()
                     updateHSeek()
+                    applyEnforce()
                 }
             }
         }
@@ -908,13 +911,12 @@ class Panel(val act: MainActivity, val num: Int) {
         if (g < 0) g = 0
         if (!scrollMode) page = g / act.linesPerPage + 1
         refreshWindow()
-        val idx = g - winBase
-        list.setSelectionFromTop(if (idx < 0) 0 else idx, t)
-        list.post { list.setSelectionFromTop(if (idx < 0) 0 else idx, t) }
+        startEnforce(g, t)
         act.updateFileLabels()
     }
 
     fun tick() {
+        applyEnforce()
         checkReload()
         val s = src ?: return
         tryRestore()
@@ -931,8 +933,7 @@ class Panel(val act: MainActivity, val num: Int) {
             pendingGlobal = -1
             if (!scrollMode) page = g / act.linesPerPage + 1
             refreshWindow()
-            val idx = g - winBase
-            list.post { list.setSelectionFromTop(if (idx < 0) 0 else idx, top) }
+            startEnforce(g, top)
         } else if (s.done) {
             pendingGlobal = -1
         }
@@ -1015,10 +1016,43 @@ class Panel(val act: MainActivity, val num: Int) {
     var savedG: Int = -1
     var savedT: Int = 0
 
+    // Restore enforcement: a list refresh right after a restore can reset the list to
+    // the top, so the target is re-applied until the list really sits there.
+    var enforceG: Int = -1
+    var enforceT: Int = 0
+    var enforceUntil: Long = 0L
+
+    fun startEnforce(g: Int, tp: Int) {
+        if (g < 0) return
+        enforceG = g
+        enforceT = tp
+        savedG = g
+        savedT = tp
+        enforceUntil = System.currentTimeMillis() + 4000L
+        for (d in longArrayOf(0L, 80L, 250L, 600L, 1200L, 2500L)) {
+            act.handler.postDelayed({ applyEnforce() }, d)
+        }
+    }
+
+    fun applyEnforce() {
+        if (enforceG < 0) return
+        if (System.currentTimeMillis() > enforceUntil) {
+            enforceG = -1
+            return
+        }
+        if (!list.isShown || list.width <= 0 || list.height <= 0) return
+        val idx = enforceG - winBase
+        if (idx < 0 || idx >= winCount) return
+        val c = list.getChildAt(0)
+        val ok = c != null && list.firstVisiblePosition == idx && c.top == enforceT
+        if (!ok) list.setSelectionFromTop(idx, enforceT)
+    }
+
     private fun listLive(): Boolean = list.isShown && list.childCount > 0
 
     fun firstGlobal(): Int {
         if (pendingGlobal >= 0) return pendingGlobal
+        if (enforceG >= 0) return enforceG
         if (listLive()) {
             savedG = winBase + list.firstVisiblePosition
             val c = list.getChildAt(0)
@@ -1031,6 +1065,7 @@ class Panel(val act: MainActivity, val num: Int) {
 
     fun firstTop(): Int {
         if (pendingGlobal >= 0) return pendingTop
+        if (enforceG >= 0) return enforceT
         if (listLive()) {
             val c = list.getChildAt(0)
             savedT = if (c != null) c.top else 0
@@ -1044,12 +1079,7 @@ class Panel(val act: MainActivity, val num: Int) {
     // Re-apply the remembered position (used when a hidden panel becomes visible again).
     fun reapplyPosition() {
         if (pendingGlobal >= 0 || savedG < 0) return
-        val g = savedG
-        val tp = savedT
-        list.post {
-            val idx = g - winBase
-            if (idx >= 0 && idx < winCount) list.setSelectionFromTop(idx, tp)
-        }
+        startEnforce(savedG, savedT)
     }
 
     fun applyModeUi() {
@@ -1484,6 +1514,12 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        saveView()
+        saveMaps()
+    }
+
+    override fun onStop() {
+        super.onStop()
         saveView()
         saveMaps()
     }
