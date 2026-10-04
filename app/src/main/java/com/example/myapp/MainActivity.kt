@@ -838,6 +838,10 @@ class Panel(val act: MainActivity, val num: Int) {
         winCount = 0
         pendingGlobal = restoreGlobal
         pendingTop = restoreTop
+        if (restoreGlobal >= 0) {
+            savedG = restoreGlobal
+            savedT = restoreTop
+        }
         if (u == null) {
             fileName = ""
             refreshWindow()
@@ -1006,15 +1010,46 @@ class Panel(val act: MainActivity, val num: Int) {
         }
     }
 
+    // Last known on-screen position. A hidden (single-file mode) or not-yet-laid-out
+    // list reports position 0, so we keep the last real value instead of overwriting it.
+    var savedG: Int = -1
+    var savedT: Int = 0
+
+    private fun listLive(): Boolean = list.isShown && list.childCount > 0
+
     fun firstGlobal(): Int {
         if (pendingGlobal >= 0) return pendingGlobal
+        if (listLive()) {
+            savedG = winBase + list.firstVisiblePosition
+            val c = list.getChildAt(0)
+            savedT = if (c != null) c.top else 0
+            return savedG
+        }
+        if (savedG >= 0) return savedG
         return winBase + list.firstVisiblePosition
     }
 
     fun firstTop(): Int {
         if (pendingGlobal >= 0) return pendingTop
-        val c = list.getChildAt(0)
-        return if (c != null) c.top else 0
+        if (listLive()) {
+            val c = list.getChildAt(0)
+            savedT = if (c != null) c.top else 0
+            savedG = winBase + list.firstVisiblePosition
+            return savedT
+        }
+        if (savedG >= 0) return savedT
+        return 0
+    }
+
+    // Re-apply the remembered position (used when a hidden panel becomes visible again).
+    fun reapplyPosition() {
+        if (pendingGlobal >= 0 || savedG < 0) return
+        val g = savedG
+        val tp = savedT
+        list.post {
+            val idx = g - winBase
+            if (idx >= 0 && idx < winCount) list.setSelectionFromTop(idx, tp)
+        }
     }
 
     fun applyModeUi() {
@@ -1615,8 +1650,13 @@ class MainActivity : Activity() {
             lp.setMargins(dp(3), dp(3), dp(3), dp(3))
             p.root.layoutParams = lp
         }
-        p1.root.visibility = if (layoutMode == 3) View.GONE else View.VISIBLE
-        p2.root.visibility = if (layoutMode == 2) View.GONE else View.VISIBLE
+        for (p in listOf(p1, p2)) {
+            p.firstGlobal()
+            val wasHidden = p.root.visibility != View.VISIBLE
+            val hide = (p.num == 1 && layoutMode == 3) || (p.num == 2 && layoutMode == 2)
+            p.root.visibility = if (hide) View.GONE else View.VISIBLE
+            if (wasHidden && !hide) p.reapplyPosition()
+        }
     }
 
     private fun cycleLayout() {
